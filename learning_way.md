@@ -9,26 +9,27 @@
 不过分追求细节，本就需要不断的精进。
 学习计划：1-2周。周日回家要学习。
 ## 必须掌握的核心概念：
-├── 自注意力机制 (Self-Attention)   复习下就行
-│   ├── Scaled Dot-Product Attention
-│   ├── Multi-Head Attention
-│   └── 注意力可视化与可解释性
-├── 位置编码 (Positional Encoding) 难点，这个地方要重点学习下
-│   ├── 绝对位置编码 (Sinusoidal)
-│   ├── 相对位置编码 (RoPE, ALiBi) ⭐ 重点 
-│   └── 旋转位置编码的推导与实现
-├── 前馈网络与归一化    复习下
-│   ├── Pre-Norm vs Post-Norm
-│   ├── RMSNorm (LLaMA, InternLM使用)
-│   └── SwiGLU激活函数
-└── 解码策略
-    ├── Greedy/Beam Search
-    ├── Temperature Sampling
-    └── Top-p/Top-k Sampling
+├── 自注意力机制 (Self-Attention)   复习下就行  
+│   ├── Scaled Dot-Product Attention  
+│   ├── Multi-Head Attention  
+│   └── 注意力可视化与可解释性  
+├── 位置编码 (Positional Encoding) 难点，这个地方要重点学习下  
+│   ├── 绝对位置编码 (Sinusoidal)  
+│   ├── 相对位置编码 (RoPE, ALiBi) ⭐ 重点   
+│   └── 旋转位置编码的推导与实现  
+├── 前馈网络与归一化    复习下  
+│   ├── Pre-Norm vs Post-Norm  
+│   ├── RMSNorm (LLaMA, InternLM使用)  
+│   └── SwiGLU激活函数  
+└── 解码策略  
+    ├── Greedy/Beam Search  
+    ├── Temperature Sampling  
+    └── Top-p/Top-k Sampling  
+    
 ## 相关论文
-《Attention Is All You Need》(2017) - 奠基之作
-《RoFormer: Enhanced Transformer with Rotary Position Embedding》- RoPE
-《GLU Variants Improve Transformer》- SwiGLU
+《Attention Is All You Need》(2017) - 奠基之作  
+《RoFormer: Enhanced Transformer with Rotary Position Embedding》- RoPE  
+《GLU Variants Improve Transformer》- SwiGLU  
 ## 继续学习
 # 第三阶段：ViT
 ## 目标与计划
@@ -55,21 +56,22 @@ EVA-02/CLIP-ViT - 大规模预训练视觉编码器
 token是什么
 怎么得到token啥的
 ## 核心架构变体：
-├── Decoder-only (GPT风格) - 主流
-│   ├── GPT-3/4架构细节
-│   ├── LLaMA/LLaMA2/LLaMA3架构演进
-│   └── InternLM2/3架构特点 ⭐
-├── Encoder-Decoder (T5风格)
-│   └── 适用于特定任务
-└── 混合专家 (MoE)
-    ├── Switch Transformer
-    ├── Mixtral 8x7B
-    └── DeepSeek-MoE ⭐ 前沿
+├── Decoder-only (GPT风格) - 主流  
+│   ├── GPT-3/4架构细节  
+│   ├── LLaMA/LLaMA2/LLaMA3架构演进  
+│   └── InternLM2/3架构特点 ⭐  
+├── Encoder-Decoder (T5风格)  
+│   └── 适用于特定任务  
+└── 混合专家 (MoE)  
+    ├── Switch Transformer  
+    ├── Mixtral 8x7B  
+    └── DeepSeek-MoE ⭐ 前沿  
 ## 关键实现细节（影响训练稳定性和效果）：
-KV-Cache优化：推理加速核心
-FlashAttention v1/v2/v3：内存与计算优化 ⭐ 必须掌握
-激活检查点 (Activation Checkpointing)：节省显存
-梯度累积与混合精度训练
+KV-Cache优化：推理加速核心  
+FlashAttention v1/v2/v3：内存与计算优化 ⭐ 必须掌握  
+激活检查点 (Activation Checkpointing)：节省显存  
+梯度累积与混合精度训练  
+
 # 第五阶段：训练方法
 目标：实现的重要部分，掌握先进的训练技巧。这里多和邱博，晓鹏请教讨论
 计划：学习周期4-6周。到这一步，就比较有条不紊了。
