@@ -205,4 +205,406 @@
             "手表"
         ]
     }以及1000条短查询比如：身穿白色短袖的女孩，一家三口等。现在需要找到一个方法能通过短查询可以返回和短查询最相关的几个结构化文本。请帮我设计方案，其中文本embedding方法以及相似度函数计算我有固定范式
+
 https://swift.readthedocs.io/zh-cn/latest/BestPractices/MLLM-Registration.html#id4
+Python
+复制
+ms-swift解析-kimi2.6
+
+        audio_token_id = self._tokenize('|<|AUDIO|>')
+        idx_list = findall(input_ids, audio_token_id)  # 查找所有的audio_token
+解析：将 |<|AUDIO|> 转为单个 token ID，并在 input_ids 序列中找到所有出现位置。
+Python
+复制
+        feature_attention_mask = media_inputs.get('feature_attention_mask')
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+            audio_lengths = ((audio_feature_lengths - 1) // 2 + 1 - 2) // 2 + 1
+        else:
+            audio_lengths = None
+        audio_lengths_origin = audio_lengths
+解析：根据 feature_attention_mask 计算每段音频的有效长度，再通过公式 ((L-1)//2 +1 -2)//2 +1 计算音频编码器（audio_tower）下采样后的输出长度。这个长度就是需要插入到 input_ids 中的 audio token 数量。
+Python
+复制
+        video_audios_mask = []
+        for i, audio in enumerate(inputs.audios):
+            if isinstance(audio, tuple) and audio[1] == 'video':
+                inputs.audios[i] = audio[0]
+                video_audios_mask.append(True)
+            else:
+                video_audios_mask.append(False)
+        video_audios_mask = torch.tensor(video_audios_mask)
+解析：标记哪些音频是从视频里提取出来的（True），哪些是独立音频（False）。
+Python
+复制
+        if idx_list:
+            if self.use_audio_in_video:
+                audio_lengths = audio_lengths[~video_audios_mask]
+解析：若开启视频音频混合，过滤掉来源于视频的 audio token（因为它们会在 video 部分被交错处理，不在这里单独展开）。
+Python
+复制
+            def _get_new_audio_tokens(i):
+                return audio_token_id * audio_lengths[i]
+            input_ids, labels, loss_scale = self._extend_tokens(
+                input_ids, labels, loss_scale, idx_list, _get_new_audio_tokens)
+解析：_extend_tokens 是 Swift 模板基类方法。它将 input_ids 中第 i 个 |<|AUDIO|> 位置，替换为 audio_lengths[i] 个重复的 audio_token_id。labels 和 loss_scale 同步扩展（labels 在 audio 位置通常设为 -100 不计算 loss）。
+Image / Video Token 展开
+Python
+复制
+        for media_type in ['image', 'video']:
+            token = f'|<|{media_type.upper()}|>'
+            token_id = self._tokenize(token)
+            idx_list = findall(input_ids, token_id)
+            if idx_list:
+                merge_size = processor.image_processor.merge_size
+                media_grid_thw = media_inputs.get(f'{media_type}_grid_thw')
+解析：对 |<|IMAGE|> 和 |<|VIDEO|> 执行相同逻辑。merge_size 是视觉 Patch 合并因子（如 2x2）。
+Python
+复制
+                if media_type == 'video' and self.use_audio_in_video:
+                    audio_lengths = audio_lengths_origin[video_audios_mask]
+                    video_second_per_grid = media_inputs['video_second_per_grid']
+                    _get_new_tokens_use_audio_in_video = partial(
+                        self._get_new_tokens_use_audio_in_video,
+                        video_grid_thw=media_grid_thw,
+                        video_second_per_grid=video_second_per_grid,
+                        audio_lengths=audio_lengths,
+                        video_token_id=token_id,
+                        audio_token_id=audio_token_id)
+                    input_ids, labels, loss_scale = self._extend_tokens(
+                        input_ids, labels, loss_scale, idx_list,
+                        _get_new_tokens_use_audio_in_video)
+解析：视频+音频混合场景。使用 partial 绑定参数，调用 2.7 节的交错函数，生成 video/audio 混合 token 列表并展开。
+Python
+复制
+                else:
+                    def _get_new_tokens(i):
+                        token_len = (media_grid_thw[i].prod() // (merge_size**2))
+                        return token_id * token_len
+                    input_ids, labels, loss_scale = self._extend_tokens(
+                        input_ids, labels, loss_scale, idx_list, _get_new_tokens)
+解析：纯图像/纯视频场景。token 长度 = T * H * W / (merge_size^2)。例如 224x224 图像，patch_size=14, merge_size=2，则 token 数 = (224/14)^2 / 4 = 256。
+Python
+复制
+        encoded['input_ids'] = input_ids
+        encoded['labels'] = labels
+        encoded['loss_scale'] = loss_scale
+        encoded.update(media_inputs)  # 将多模态内容加入其中
+        return encoded
+解析：将展开后的 input_ids（现在长度已包含所有媒体占位 token）与 media_inputs（pixel_values、input_features 等）合并，返回最终编码字典。
+2.9 _post_encode：生成 inputs_embeds（训练时 forward 前钩子）
+Python
+复制
+    def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.is_training:
+            return inputs
+解析：仅在训练时执行。推理时由模型自己的 prepare_inputs_for_generation 处理。
+Python
+复制
+        input_ids = inputs['input_ids']
+        input_features = inputs.get('input_features')
+        feature_attention_mask = inputs.get('feature_attention_mask')
+        base_model = self.get_base_model(model)
+        inputs_embeds = base_model.thinker.model.embed_tokens(input_ids)
+解析：
+获取基础模型（即 thinker）。
+先通过 embed_tokens 将所有 token ID（包括媒体占位符）映射为文本 embedding。此时媒体位置还是文本 embedding。
+Python
+复制
+        thinker_config = model.config.thinker_config
+        inputs_embeds = self._get_inputs_embeds_hf(
+            inputs_embeds, inputs, model.thinker.visual, self.processor, thinker_config)
+解析：视觉特征注入。_get_inputs_embeds_hf 是 Swift 基类方法，内部会：
+用 model.thinker.visual（视觉编码器）处理 pixel_values → 视觉特征。
+在 inputs_embeds 中，找到 |<|IMAGE|> / |<|VIDEO|> 对应的位置，替换为视觉特征。
+若某进程无图像（纯文本样本），则创建 dummy_image 保证 DeepSpeed ZeRO 各进程梯度同步。
+Python
+复制
+        if input_features is None:
+            if is_deepspeed_enabled() and not is_deepspeed_zero3_enabled():
+                input_features = input_ids.new_zeros([1, 128, 128], dtype=model.thinker.audio_tower.dtype)
+                feature_attention_mask = input_ids.new_ones([1, 128], dtype=torch.bool)
+                audio_res = model.thinker.get_audio_features(input_features, feature_attention_mask)
+                if hasattr(audio_res, 'last_hidden_state'):
+                    audio_embeds = audio_res.last_hidden_state
+                else:
+                    audio_embeds = audio_res
+                inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.
+        else:
+            audio_res = model.thinker.get_audio_features(input_features, feature_attention_mask)
+            if hasattr(audio_res, 'last_hidden_state'):
+                audio_embeds = audio_res.last_hidden_state
+            else:
+                audio_embeds = audio_res
+            audio_mask = (input_ids == thinker_config.audio_token_index).unsqueeze(-1).expand_as(inputs_embeds)
+            audio_embeds = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
+解析：音频特征注入。
+若 input_features 为空（纯文本 batch）且使用 DeepSpeed ZeRO2：构造 dummy 音频张量并过一遍 audio_tower，产生一个 zero-guard 操作（+ audio_embeds.mean() * 0.），确保各进程有相同计算图，防止 ZeRO2 卡住。
+若有真实音频：调用 thinker.get_audio_features（音频编码器）提取 audio_embeds。
+audio_mask：在 input_ids 中找到所有 audio_token_index（即 |<|AUDIO|> 的 ID）位置，生成布尔掩码 [batch, seq_len, 1] 并广播到 embedding 维度。
+masked_scatter：原地替换，将 audio_embeds 填充到 inputs_embeds 的音频位置上。
+Python
+复制
+        return {'inputs_embeds': inputs_embeds}
+解析：返回最终的融合 embedding。此时 inputs_embeds 中：
+文本位置：普通词嵌入。
+图像/视频位置：视觉编码器输出特征。
+音频位置：音频编码器输出特征。
+2.10 _get_position_ids：mrope 位置编码
+Python
+复制
+    def _get_position_ids(self, inputs: Dict[str, Any]):
+        feature_attention_mask = inputs.get('feature_attention_mask')
+        if feature_attention_mask is not None:
+            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+        else:
+            audio_feature_lengths = None
+        video_second_per_grid = inputs.pop('video_second_per_grid', None)
+        input_ids = inputs['input_ids']
+        attention_mask = inputs.get('attention_mask')
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+解析：收集音频长度、视频每格秒数、attention_mask。
+Python
+复制
+        position_ids, _ = self.model.thinker.get_rope_index(
+            input_ids,
+            inputs.get('image_grid_thw'),
+            inputs.get('video_grid_thw'),
+            attention_mask,
+            self.use_audio_in_video,
+            audio_feature_lengths,
+            video_second_per_grid,
+        )
+        return self._concat_text_position_ids(position_ids)
+解析：调用 Qwen2.5-Omni 特有的 get_rope_index 生成 mrope（Multimodal Rotary Position Embedding） 位置 ID。它会根据图像/视频的时空结构以及音频时长，生成三维位置编码（text/vision/audio 各一维）。最后拼接为模板需要的格式。
+2.11 _data_collator 与 _data_collator_mm_data
+Python
+复制
+    def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+        res = super()._data_collator(batch, padding_to=padding_to)
+        if not self.padding_free and self.is_training:
+            res['position_ids'] = self._get_position_ids(res)
+解析：非 padding_free 训练时，对每个 batch 重新计算 position_ids（因为 padding 后序列长度变了）。
+Python
+复制
+        if 'position_ids' in res:
+            position_ids = res['position_ids']
+            res['position_ids'] = position_ids[1:]
+            res['text_position_ids'] = text_position_ids = position_ids[0]
+            res.update(get_packed_seq_params(text_position_ids))
+        return res
+解析：
+position_ids[0]：text_position_ids，用于 FlashAttention 的 packing 参数。
+position_ids[1:]：mrope 的 vision/audio 维度位置。
+get_packed_seq_params：生成 cu_seqlens、max_seqlen 等，供 FlashAttention 的 varlen 接口使用。
+Python
+复制
+    def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        res = super()._data_collator_mm_data(batch)
+        video_second_per_grid = self.gather_list(batch, 'video_second_per_grid')
+        if video_second_per_grid:
+            res['video_second_per_grid'] = video_second_per_grid
+        input_features = [b['input_features'] for b in batch if b.get('input_features') is not None]
+        feature_attention_mask = [b['feature_attention_mask'] for b in batch if b.get('feature_attention_mask') is not None]
+        if input_features:
+            res['input_features'] = torch.concat(input_features)
+            res['feature_attention_mask'] = torch.concat(feature_attention_mask)
+        return res
+解析：处理 batch 中变长的多模态数据：
+video_second_per_grid：收集列表。
+input_features / feature_attention_mask：按 batch 维度拼接（音频特征长度可能不同，但这里已经是 pad/trim 后的张量，可直接 concat）。
+2.12 generate：推理生成
+Python
+复制
+    def generate(self, model, *args, **kwargs):
+        if kwargs.get('video_grid_thw') is not None:
+            kwargs['use_audio_in_video'] = self.use_audio_in_video
+        return super().generate(model, *args, **kwargs)
+解析：调用基类生成逻辑前，若存在视频，则把 use_audio_in_video 状态传入 kwargs，确保模型推理侧知道是否需要处理视频音轨。
+2.13 模板元数据注册
+Python
+复制
+register_template(
+    TemplateMeta(
+        'my_qwen2_5_omni', 
+        prefix=[], 
+        prompt=['<|<|im_start|>user\n{{QUERY}}\n<|<|im_start|>assistant\n'],
+        chat_sep=['\n'], 
+        suffix=['\n'],
+        system_prefix=['<|<|im_start|>system\n{{SYSTEM}}\n'],
+        default_system='You are a helpful assistant.', 
+        stop_words=['<|<|endoftext|>'],
+        agent_template='hermes',
+        template_cls=Qwen2_5OmniTemplate))
+表格
+字段	含义
+prefix	对话最开头的固定内容（无）。
+prompt	单轮格式：user 角色包裹 {{QUERY}}，然后 assistant 角色开始。{{QUERY}} 会被替换为实际文本（其中 <image> 等已被 replace_tag 替换为特殊 token）。
+chat_sep	多轮对话之间的分隔符（换行）。
+suffix	整个对话末尾追加的 token（换行）。
+system_prefix	系统提示词格式。
+default_system	默认系统提示。
+stop_words	生成停止词 `	<	endoftext	>`。
+agent_template='hermes'	若使用 Agent 模式（工具调用），采用 Hermes 格式。
+2.14 测试入口
+Python
+复制
+if __name__ == '__main__':
+    model, processor = get_model_processor('Qwen/Qwen2.5-Omni-7B', model_type='my_qwen2_5_omni')
+    template = get_template(processor, template_type='my_qwen2_5_omni')
+    data = {
+        'messages': [
+            {'role': 'user', 'content': '描述视频<<video>与图片<<image>内容。'},
+            {'role': 'assistant', 'content': '一个小孩和一只猫咪。'},
+        ],
+        'videos': ['https://.../baby.mp4'],
+        'images': ['https://.../cat.png'],
+    }
+    template.set_mode('train')
+    encoded = template.encode(data)
+    print('input_ids: ' + template.safe_decode(encoded['input_ids']))
+    print('labels: ' + template.safe_decode(encoded['labels']))
+    print('keys: ' + str(encoded.keys()))
+解析：测试流程：
+get_model_processor → 触发文件一的 Qwen2_5OmniLoader，加载模型与处理器。
+get_template → 获取文件二注册的模板实例。
+template.encode(data) → 依次调用 replace_tag → _encode → _post_encode（训练模式），输出编码后的字典。
+三、完整数据流：从原始输入到模型输出
+下面以训练模式为例，用一张“流水线”梳理从用户输入到进入模型 forward 的全过程。
+Stage 0: 原始输入（用户 JSON）
+JSON
+复制
+{
+  "messages": [
+    {"role": "user", "content": "描述视频<<video>与图片<<image>内容，并解释音频<audio>。"},
+    {"role": "assistant", "content": "..."}
+  ],
+  "videos": ["/path/to/video.mp4"],
+  "images": ["/path/to/image.png"],
+  "audios": ["/path/to/audio.wav"]
+}
+Stage 1: replace_tag（媒体加载 & 文本标签替换）
+表格
+媒体	动作	文本替换结果
+Image	fetch_image → PIL Image 缓存到 inputs.images[0]	<image> → `	<	vision_bos	>	<	IMAGE	>	<	vision_eos	>`
+Video	fetch_video → 帧张量 [T,H,W,C] 缓存到 inputs.videos[0]	<video> → `	<	vision_bos	>	<	VIDEO	>	<	vision_eos	>（若 use_audio_in_video=True则同时提取音轨插入inputs.audios`，tag 变为 vision+audio 组合）
+Audio	load_audio → numpy 波形 [samples] 缓存到 inputs.audios[0]	<audio> → `	<	audio_bos	>	<	AUDIO	>	<	audio_eos	>`
+Stage 1 输出：inputs 对象内所有媒体已加载为张量/对象；文本中的媒体标签已变为带占位符（|<|IMAGE|> 等）的特殊 token 字符串。
+Stage 2: _encode（Token 化 & 媒体特征预处理）
+2a. 纯文本编码
+父类 Template._encode 将对话格式化为：
+plain
+复制
+<|im_start|>user\n描述视频<|<|vision_bos|>|<|VIDEO|>|<|vision_eos|>与图片<|<|vision_bos|>|<|IMAGE|>|<|vision_eos|>内容，并解释音频<|<|audio_bos|>|<|AUDIO|>|<|audio_eos|>。\n<|<|im_start|>assistant\n...
+文本转为 input_ids、labels（response 部分 label 非 -100，prompt 部分为 -100）。
+2b. Processor 处理媒体
+Python
+复制
+media_inputs = processor(text='', audio=..., images=..., videos=..., return_tensors='pt')
+生成：
+image_pixel_values, image_grid_thw（图像的 patch 时空信息）
+video_pixel_values, video_grid_thw, video_second_per_grid（视频帧信息）
+input_features, feature_attention_mask（音频频谱特征）
+2c. 计算各媒体实际 Token 长度
+Audio：audio_lengths = ((feature_len - 1) // 2 + 1 - 2) // 2 + 1（音频编码器下采样后的序列长度）。
+Image/Video：token_len = grid_thw.prod() // (merge_size**2)（视觉 Patch 数）。
+2d. 展开占位符 Token
+在 input_ids 中找到 |<|AUDIO|> 的位置 → 替换为 audio_token_id 重复 audio_lengths[i] 次。
+找到 |<|IMAGE|> 的位置 → 替换为 image_token_id 重复图像 token 数次。
+找到 |<|VIDEO|> 的位置 → 替换为视频 token（若含音频则交错视频+音频 token）。
+Stage 2 输出：
+Python
+复制
+{
+  'input_ids':      [batch, seq_len]  # 已展开，长度包含所有媒体 token
+  'labels':         [batch, seq_len]  # 仅 response 部分有效
+  'loss_scale':     [batch, seq_len]  # 可选
+  'pixel_values':   [batch, n_patches, C, H, W]  # 图像
+  'image_grid_thw': [batch, 3]  # T, H, W
+  'video_pixel_values': [...]   # 视频
+  'video_grid_thw': [...]
+  'input_features': [batch, audio_len, feature_dim]  # 音频
+  'feature_attention_mask': [batch, audio_len]
+  'video_second_per_grid': [...]  # 视频时间参数
+}
+Stage 3: _post_encode（生成融合后的 inputs_embeds）
+此阶段在 model.forward 之前执行（作为 pre_forward_hook）。
+3a. 文本 Embedding
+Python
+复制
+inputs_embeds = thinker.model.embed_tokens(input_ids)
+所有位置先填充文本 embedding（媒体位置此时是“假”的文本向量）。
+3b. 视觉特征注入
+Python
+复制
+inputs_embeds = _get_inputs_embeds_hf(
+    inputs_embeds, inputs, model.thinker.visual, processor, thinker_config
+)
+内部逻辑：
+用 thinker.visual（ViT + Merger）处理 pixel_values（图像/视频）→ 视觉特征向量。
+根据 image_grid_thw / video_grid_thw 找到 input_ids 中 |<|IMAGE|> / |<|VIDEO|> 的索引。
+替换：将对应位置的 inputs_embeds 替换为视觉特征。
+若 batch 中某样本无图，创建 dummy_image 过视觉模型，保证 DeepSpeed ZeRO 同步。
+3c. 音频特征注入
+Python
+复制
+audio_res = thinker.get_audio_features(input_features, feature_attention_mask)
+audio_embeds = audio_res.last_hidden_state
+audio_mask = (input_ids == audio_token_index).unsqueeze(-1)
+inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
+用 thinker.audio_tower 处理 input_features → audio_embeds。
+masked_scatter：将所有 |<|AUDIO|> 位置的 embedding 替换为音频特征。
+Stage 3 输出：
+Python
+复制
+{'inputs_embeds': [batch, seq_len, hidden_dim]}  # 文本+视觉+音频已融合
+Stage 4: _data_collator（Batch 组装）
+4a. Padding
+对 input_ids、labels、inputs_embeds 等按 batch 最大长度补零。
+4b. mrope Position IDs
+Python
+复制
+position_ids = get_rope_index(...)  # 3D: [3, batch, seq_len]
+维度 0：text_position_ids
+维度 1：vision_position_ids（空间+时间）
+维度 2：audio_position_ids
+4c. FlashAttention Packing 参数
+Python
+复制
+res.update(get_packed_seq_params(text_position_ids))
+生成 cu_seqlens、max_seqlen 等，支持 padding_free 训练。
+Stage 4 输出：一个完整的 batch 字典，可直接送入 model.forward。
+Stage 5: Model Forward / Generate
+训练时：
+Python
+复制
+outputs = model(
+    inputs_embeds=inputs_embeds,      # 融合后的 embedding
+    position_ids=position_ids,        # mrope 位置编码
+    attention_mask=attention_mask,  # 因果掩码
+    labels=labels,
+)
+loss = outputs.loss  # 仅在非 -100 的 label 位置计算交叉熵
+推理时（Generate）：
+不走 _post_encode（由模型内部 prepare_inputs_for_generation 处理）。
+template.generate 调用 super().generate，传入 use_audio_in_video 等参数。
+模型自回归生成 token ID → 解码为文本。
+若配置 enable_audio_output，talker + token2wav 会额外生成音频波形输出（此模板主要管理 thinker 的文本部分）。
+Stage 6: 最终输出
+表格
+模态	输出内容
+文本	生成的文本序列（由 thinker.lm_head 输出 logits 采样/贪婪解码）。
+音频	若开启音频输出，由 talker 生成语义 token，token2wav 合成波形（文件一中 generator 部分，始终冻结，仅推理）。
+四、关键设计总结
+表格
+设计点	作用
+架构分层（MultiModelKeys）	让 Swift 知道 thinker 是 LLM，talker/token2wav 是冻结生成器，以便正确执行 LoRA/冻结/保存。
+use_submodel_func	把外层 model.forward 代理到 thinker，使 Swift 的统一训练接口能直接驱动多模态核心。
+replace_tag + _encode 分离	replace_tag 负责加载媒体并插入占位 token；_encode 负责计算长度并展开占位符。这种分离让代码清晰且易于扩展。
+_post_encode 的 dummy 机制	解决 DeepSpeed ZeRO2/3 在多模态混合 batch（有的有图、有的无图）时的梯度同步/卡死问题。
+mrope 位置编码	Qwen2.5-Omni 的核心，让 LLM 同时感知文本、视觉（2D空间+时间）、音频（1D时间）的位置关系。
+音频/视频交错 token（use_audio_in_video）	支持视频+音频联合建模，时间块级别交错排列 token，保持时序对齐。
+以上即两个文件的全部代码解析及从原始路径到模型输入的完整数据流。
+
