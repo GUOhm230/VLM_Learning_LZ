@@ -205,3 +205,4 @@
             "手表"
         ]
     }以及1000条短查询比如：身穿白色短袖的女孩，一家三口等。现在需要找到一个方法能通过短查询可以返回和短查询最相关的几个结构化文本。请帮我设计方案，其中文本embedding方法以及相似度函数计算我有固定范式
+https://swift.readthedocs.io/zh-cn/latest/BestPractices/MLLM-Registration.html#id4
